@@ -1,0 +1,322 @@
+---
+title: "EOW_camtrapdp_tutorial"
+author: "Martijn Bollen"
+date: "2025-05-05"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+# 0. Introduction
+
+In this tutorial I will show how to import, filter and pre-process camera trap data using the `camtrapdp` package.
+By following the step-by-step process in this tutorial, you will be able to share data in the context of the [EOW](https://www.eowilsonfoundation.org) biodiversity monitoring using camera traps.
+
+Let's start by loading the required packages
+
+```{r setup, include=FALSE}
+library(camtrapdp)
+library(lubridate)
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(rgbif)
+```
+
+For this tutorial we will rely on an example dataset, published on GBIF and accessed through the `rgbif` package.
+Available datasets include:
+
+```{r rgbif datasets}
+gbif_datasets <- function() {
+  datasets <- occ_count(facet = "datasetKey", protocol = "CAMTRAP_DP")
+  safe_dataset_get <- possibly(dataset_get, otherwise = NULL)
+  
+  datasets <- datasets |>
+    rowwise() |>
+    mutate(metadata = list(safe_dataset_get(datasetKey))) |>
+    unnest_wider(metadata)
+  
+  return(datasets)
+}
+  
+datasets <- gbif_datasets()
+datasets
+```
+
+Now let's download the "Dataset from Snapshot Japan 2023" as our example dataset.
+
+```{r rgbif download}
+dataset <- datasets |> filter(title == "Dataset from Snapshot Japan 2023")
+ctdp_path <- tempdir()
+zip_path <- file.path(ctdp_path, "snapshot_japan.zip")
+download.file(url = dataset$endpoints[[1]][[1]]$url, zip_path, method = "curl")
+```
+
+# 1. Import Camtrap DP datasets
+
+Now that we have downloaded our example dataset, it is time to import the data.
+If you have exported your own dataset from Agouti, or another file manager, you should start your workflow here.
+
+```{r import}
+unzip(zip_path, exdir = tempdir())
+ctdp <- read_camtrapdp(file.path(tempdir(), "datapackage.json"))
+proj <- ctdp$name
+
+# Check the structure of the data package
+ctdp
+```
+
+# 2. Identify parsing problems, if any
+
+Before filtering the dataset to the EOW survey period, we will check if there are any parsing problems in either the `deployments`, `media` or `observations` tables.
+
+```{r parsing problems}
+# Check for parsing problems
+problems <- function(datapackage){
+  
+  dep <- datapackage$data$deployments
+  obs <- datapackage$data$observations
+  
+  # check for locations with the same coordinates
+  loc_dup_coords <- dep |> 
+    group_by(locationID, latitude, longitude) |>
+    distinct() |> 
+    ungroup() |> 
+    group_by(latitude, longitude) |> 
+    summarize(n_locs = n()) |> 
+    filter(n_locs > 1)
+  
+  # check for locations with same name
+  loc_dup_names <- dep |> 
+    group_by(locationName, latitude, longitude) |> 
+    distinct() |> 
+    ungroup() |> 
+    group_by(locationName) |> 
+    summarise(n_locs = n()) |> 
+    filter(n_locs > 1)
+  
+  # check for locations with same locationID
+  loc_dup_IDs <- dep |> 
+    group_by(locationID, latitude, longitude) |> 
+    distinct() |> 
+    ungroup() |> 
+    group_by(locationID) |> 
+    summarise(n_locs = n()) |> 
+    filter(n_locs > 1)
+  
+  # check for records outside the sampling period at the related deployment
+  seq_out <- obs |> 
+    left_join(dep |> select(deploymentID, locationID, locationName, deploymentStart, deploymentEnd)) |> 
+    mutate(issues = ifelse(eventStart < deploymentStart | eventEnd > deploymentEnd, "Yes", "No")) |> 
+    filter(issues == "Yes") |> 
+    select(-issues)
+  
+  # check for multiple simultaneously-active deployments at the same location
+  dep_overlap <- dep |> 
+    arrange(locationID, locationName, deploymentStart) |> 
+    group_by(locationID, locationName) |> 
+    mutate(issues = ifelse(deploymentStart < lag(deploymentEnd), "Yes", "No")) |> 
+    filter(issues == "Yes") |> 
+    select(-issues)
+  
+  # build output object
+  res <- list(loc_dup_coords, loc_dup_names, loc_dup_IDs, seq_out, dep_overlap)
+  return(res)
+}
+
+ctdp_problems <- problems(ctdp)
+if(all(lapply(ctdp_problems, nrow) == 0)) {
+  print("No parsing problems found.")
+} else {
+  print("Parsing problems found:")
+  # for (i in seq_along(ctdp_problems)) {
+  #   if (nrow(ctdp_problems[[i]]) > 0) {
+  #     print(paste(names(ctdp_problems)[i], "has parsing problems:"))
+  #     print(ctdp_problems[[i]])
+  #   }
+  # }
+  if (nrow(ctdp_problems[[1]]) > 0) {
+    print(paste("There are", nrow(ctdp_problems[[1]]), "cases in which the same coordinates are associated with more than one location. Check the object ctdp_problems[[1]] for details."))
+    print(ctdp_problems[[1]])
+  }
+  
+  if (nrow(ctdp_problems[[2]]) > 0) {
+    print(paste("There are", nrow(ctdp_problems[[2]]), "cases in which two or more locations have the same locationName. Check the object ctdp_problems[[2]] for details."))
+    print(ctdp_problems[[2]])
+  }
+  
+  if (nrow(ctdp_problems[[3]]) > 0) {
+    print(paste("There are", nrow(ctdp_problems[[3]]), "cases in which two or more locations have the same locationID. . Check the object ctdp_problems[[3]] for details."))
+    print(ctdp_problems[[3]])
+  }
+  
+  if (nrow(ctdp_problems[[4]]) > 0) {
+    print(paste("There are", nrow(ctdp_problems[[4]]), "observations dated outside the sampling period of the related deployment. Check the object ctdp_problems[[4]] for details."))
+    print(ctdp_problems[[4]])
+  }
+  
+  if (nrow(ctdp_problems[[5]]) > 0) {
+    print(paste("There are", nrow(ctdp_problems[[5]]), "deployments with sampling periods that (at least partially) overlap deployment at the same location. Check the object ctdp_problems[[5]] for details."))
+    print(ctdp_problems[[5]])
+  }
+} 
+```
+
+# 3. Filter data that is within the desired time period and export
+
+The EOW survey period runs from 1st September to 31st October.
+However, a 15-day buffer was set, such that all records from 15th August to 15th November are retained.
+We will use the `filter_deployments()` and `filter_media()` functions to filter the dataset to this time period.
+After that, we will truncate the deployment start (`deploymentStart`) and end (`deploymentEnd`) dates to the EOW survey period, in case that they are outside this period.
+I.e. a deployment starting on 3th August will be truncated to 15th August, and a deployment ending on 20th November will be truncated to 15th November.
+Finally, we will export the filtered dataset to separate folders for each year present in the data.
+
+```{r filter and export}
+# Specify the export directory
+exdir <- normalizePath(tempdir(), winslash = "/", mustWork = FALSE)
+
+# Loop over all years in the dataset
+years <- year(ctdp$temporal$start):year(ctdp$temporal$end)
+no_deps <- NULL
+
+for (y in years) {
+  eow_start <- ymd(paste0(y, "-08-15")) # EOW survey starts on 15th August
+  eow_end <- ymd(paste0(y, "-11-15")) # EOW survey ends on 15th November
+  
+  # Filter deployments that overlap the EOW survey period 
+  # (15th August - 15th November)
+  out <- ctdp |> 
+    filter_deployments(
+      year(deploymentStart) == y,
+      int_overlaps(
+        interval(as.Date(deploymentStart), as.Date(deploymentEnd)),
+        interval(eow_start, eow_end)
+      )
+    )
+  
+  # Discard media files outside the EOW survey period 
+  # (this automatically filters observations as well)
+  # but we will filter observations explicitly as well
+  out <- out |> 
+    filter_media(
+      as.Date(timestamp) %within% interval(eow_start, eow_end)
+    ) |> filter_observations(
+      as.Date(eventStart) %within% interval(eow_start, eow_end),
+      as.Date(eventEnd) %within% interval(eow_start, eow_end)
+    )
+
+  # Truncate the deploymentStart and deploymentEnd to the EOW survey period
+  deployments(out) <- deployments(out) |>
+    mutate(
+      deploymentStart = pmax(deploymentStart, eow_start),
+      deploymentEnd = pmin(deploymentEnd, eow_end)
+    )
+  
+  if (camtrapdp:::version(out) == "1.0.1") {
+    # Set version to 1.0, since there are no rs.gbif.org schemas for 1.0.1
+    camtrapdp:::version(out) <- "1.0"
+    out$directory <- exdir
+    out$platform <- out$sources[[1]]
+    out$name <- paste("EOW", proj, y, sep = "-")
+  }
+  
+  # replace NA by an empty string in taxonomic data
+  replace_na_recursive <- function(x) {
+    if (is.null(x)) {
+      return(NULL)
+    } else if (is.atomic(x)) {
+      # atomic vectors like character, numeric, etc.
+      x[is.na(x)] <- ""
+      return(x)
+    } else if (is.list(x)) {
+      return(lapply(x, replace_na_recursive))
+    } else {
+      return(x)  # for other types (e.g. functions, language objects)
+    }
+  }
+  out$taxonomic <- replace_na_recursive(out$taxonomic)
+  
+  if (nrow(deployments(out)) == 0) {
+    message("No deployments found for year ", y)
+    no_deps <- c(no_deps, y)
+    next
+  }
+  write_camtrapdp(out, file.path(exdir, paste("EOW", proj, y, sep = "-")))
+}
+```
+
+# 4. Check if exported datasets can be imported again
+
+Finally, we will also check if all dates and datetimes are within the EOW survey period. 
+But this should not be necessary, since we already filtered the data to this period.
+
+```{r check export}
+for (y in years) {
+  eow_start <- ymd(paste0(y, "-08-15")) # EOW survey starts on 15th August
+  eow_end <- ymd(paste0(y, "-11-15")) # EOW survey ends on 15th November
+  
+  if (y %in% no_deps) {
+    message("No deployments found for year ", y)
+    next
+  }
+  
+  message("Trying to import EOW dataset for year ", y)
+  test <- camtrapdp::read_camtrapdp(file.path(exdir, paste("EOW", proj, y, sep = "-"), "datapackage.json"))
+  
+  # Check if all dates and datetimes are within the EOW survey period
+  if(!is.null(test)) {
+    check_datetimes <- function(out, eow_start, eow_end) {
+      eow_start_time <- ymd_hms(paste(eow_start, "00:00:00"))
+      eow_end_time   <- ymd_hms(paste(eow_end, "23:59:59"))
+    
+      ds <- deployments(out)
+      ms <- media(out)
+      obs <- observations(out)
+    
+      issues_found <- FALSE
+      messages <- list()
+    
+      # Collect warnings instead of printing immediately
+      idx <- which(ds$deploymentStart < eow_start)
+      if (length(idx) > 0) {
+        messages <- c(messages, sprintf("⚠️ Deployments starting before EOW start: rows [%s]", paste(idx, collapse = ", ")))
+        issues_found <- TRUE
+      }
+    
+      idx <- which(ds$deploymentEnd > eow_end)
+      if (length(idx) > 0) {
+        messages <- c(messages, sprintf("⚠️ Deployments ending after EOW end: rows [%s]", paste(idx, collapse = ", ")))
+        issues_found <- TRUE
+      }
+    
+      idx <- which(ms$timestamp < eow_start_time)
+      if (length(idx) > 0) {
+        messages <- c(messages, sprintf("⚠️ Media with timestamps before EOW start: rows [%s]", paste(idx, collapse = ", ")))
+        issues_found <- TRUE
+      }
+    
+      idx <- which(obs$eventStart > eow_end_time)
+      if (length(idx) > 0) {
+        messages <- c(messages, sprintf("⚠️ Observations with eventStart after EOW end: rows [%s]", paste(idx, collapse = ", ")))
+        issues_found <- TRUE
+      }
+    
+      idx <- which(obs$eventStart < eow_start_time)
+      if (length(idx) > 0) {
+        messages <- c(messages, sprintf("⚠️ Observations with eventStart before EOW start: rows [%s]", paste(idx, collapse = ", ")))
+        issues_found <- TRUE
+      }
+    
+      # Print results
+      if (issues_found) {
+        cat(paste(sapply(messages, function(m) paste0(m, "\n\n")), collapse = ""))
+      } else {
+        message("✅ All checks passed. No data issues detected.")
+      }
+    }
+    
+    check_datetimes(test, eow_start, eow_end)
+  }
+}
+```
